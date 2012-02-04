@@ -25,6 +25,12 @@ parse_message = lambda data: json.loads(data)
 class Channel(object):
     def __init__(self, socket):
         self.socket = socket
+        
+        self.incoming = Queue(None)
+        self.outgoing = Queue(None)
+
+        self.reader = gevent.spawn(self.do_read)
+        self.writer = gevent.spawn(self.do_write)
 
     def do_read(self):
         pass
