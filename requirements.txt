@@ -1,0 +1,6 @@
+gevent
+gevent_websocket
+pyramid
+pyramid_debugtoolbar
+paste
+pastescript
