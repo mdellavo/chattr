@@ -17,7 +17,8 @@ import uuid
 
 log = logging.getLogger(__name__)
 
-message = lambda type_, data=None: json.dumps({'type': type_, 'data': data})
+message = lambda type_, data=None: {'type': type_, 'data': data}
+flatten_message = lambda msg: json.dumps(msg)
 parse_message = lambda data: json.loads(data)
 
 # FIXME add reader/writer greenlets incoming/outgoing queus
@@ -25,12 +26,21 @@ class Channel(object):
     def __init__(self, socket):
         self.socket = socket
 
+    def do_read(self):
+        pass
+
+    def do_write(self):
+        pass
+
+    def run(self):
+        pass
+
     def receive(self):
         data = self.socket.receive()
         return parse_message(data) if data is not None else None
 
     def send(self, type_, data):
-        return self.socket.send(message(type_, data))
+        return self.socket.send(flatten_message(message(type_, data)))
 
     def send_ping(self):
         return self.send('ping', time.time())
@@ -79,7 +89,7 @@ class ChannelCollection(object):
         del self.channels[avatar.uid]
 
     def get(self, o):
-        if isinstance(Avatar, o):
+        if isinstance(o, Avatar):
             uid = o.uid
         else:
             uid = o
@@ -98,6 +108,45 @@ class ChannelCollection(object):
 
     def broadcast_update(self, avatar):
         self.broadcast(Channel.send_update, avatar)
+
+
+# FIXME make a greenlet?
+class MessageHandler(object):
+
+    def __init__(self, world):
+        self.world = world
+
+    def dispatch(self, avatar, msg):
+        handler_name = 'on_' + msg['type']
+        handler = getattr(self, handler_name, None)
+
+        if handler:
+            log.debug('dispatching message %s', msg['type'])
+
+            handler(avatar, msg['data'])
+
+        return handler is not None
+
+    def on_spawn(self, avatar, data):        
+        self.world.channels.get(avatar).send_state(self.world.avatars.all())
+        self.world.channels.broadcast_spawn(avatar)
+
+    def on_die(self, avarar, data):
+        self.world.channels.broadcast_die(avatar)
+
+    def on_input(self, avatar, data):
+        input_map = {
+            'UP': (0, -1),
+            'DOWN': (0, 1),
+            'LEFT': (-1, 0),
+            'RIGHT': (1, 0)
+        }
+
+        if data in input_map:
+            dx, dy = input_map.get(data)
+            avatar.move(dx, dy)
+            self.world.channels.broadcast_update(avatar)
+
 
 class WorldThread(Greenlet):
 
@@ -124,32 +173,34 @@ class WorldThread(Greenlet):
             pass
 
     def tick(self):
-        for msg in self.incoming_messages():
-            self.message_handler.dispatch(msg)
+        for avatar, msg in self.incoming_messages():
+            self.message_handler.dispatch(avatar, msg)
             
         self.avatars.tick()
 
     def _run(self):
         self.running = True
 
-        last = time.time()
-
         while self.running:
+            last = time.time()
+
             self.tick()
             self.ticks += 1
 
             now = time.time()
-            delta = now - last
-            last = now
+            delta = now - last            
+            sleepy_time = (1.0 / self.TICKRATE)  - delta
+            log.debug('sleeping world for %s', sleepy_time)
 
-            gevent.sleep((1.0 / self.TICKRATE)  - delta)
+            gevent.sleep(sleepy_time)
 
     def spawn(self, channel):
         avatar = Avatar()
         self.avatars.add(avatar)
         self.channels.add(avatar, channel)
         self.enqueue(avatar, message('spawn'))
-
+        return avatar
+        
     def die(self, avatar):
         self.channels.remove(avatar)
         self.avatars.remove(avatar)
@@ -186,49 +237,14 @@ class Avatar(object):
     def tick(self):
         pass
 
-# FIXME make a greenlet?
-class MessageHandler(object):
-
-    def __init__(self, world):
-        self.world = world
-
-    def dispatch(self, avatar, msg):
-
-        handler_name = 'on_' + msg['type']
-        handler = getattr(self, handler_name, None)
-
-        if handler:
-            handler(avatar, msg['data'])
-
-        return handler is not None
-
-    def on_spawn(self, avatar, data):        
-        self.world.channels.get(avatar).send_state(self.world.avatars.all())
-        self.world.channels.broadcast_spawn(avatar)
-
-    def on_die(self, data):
-        self.world.channels.broadcast_die(avatar)
-
-    def on_input(self, data):
-        input_map = {
-            'UP': (0, -1),
-            'DOWN': (0, 1),
-            'LEFT': (-1, 0),
-            'RIGHT': (1, 0)
-        }
-
-        if data in input_map:
-            dx, dy = input_map.get(data)
-            self.avatar.move(dx, dy)
-            self.world.channels.broadcast_update(self.avatar)
-
-
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):
 
     channel = Channel(request.environ['wsgi.websocket'])
     avatar = World.spawn(channel)
-    
+
+    log.debug('spawned avatar %s', avatar.uid)
+
     while True:
         msg = channel.receive()
 
@@ -238,6 +254,8 @@ def endpoint(request):
         World.enqueue(avatar, msg)
 
     World.kill(avatar)
+
+    log.debug('killed avatar %s', avatar.uid)
 
     return ''
 
