@@ -21,32 +21,52 @@ message = lambda type_, data=None: {'type': type_, 'data': data}
 flatten_message = lambda msg: json.dumps(msg)
 parse_message = lambda data: json.loads(data)
 
-# FIXME add reader/writer greenlets incoming/outgoing queus
+# FIXME throttle incoming/outgoing
 class Channel(object):
     def __init__(self, socket):
         self.socket = socket
+
+        self.running = False
         
         self.incoming = Queue(None)
         self.outgoing = Queue(None)
 
-        self.reader = gevent.spawn(self.do_read)
-        self.writer = gevent.spawn(self.do_write)
+        self.reader = Greenlet(self.do_read)
+        self.writer = Greenlet(self.do_write)
 
     def do_read(self):
-        pass
+        while self.running:
+            data = self.socket.receive()
+
+            if not data:
+                break
+
+            if data:
+                self.incoming.put(parse_message(data))
 
     def do_write(self):
-        pass
+        while self.running:
+            msg = self.outgoing.get()
+            self.socket.send(flatten_message(msg))
+
+    def is_running():
+        return self.running and not any([self.reader.ready(), 
+                                         self.writier.ready()])
 
     def run(self):
-        pass
+        self.running = True
+        self.reader.start()
+        self.writer.start()
+
+    def wait(self):
+        self.running = False
+        gevent.killall([self.reader, self.writer])
 
     def receive(self):
-        data = self.socket.receive()
-        return parse_message(data) if data is not None else None
+        return self.incoming.get()
 
     def send(self, type_, data):
-        return self.socket.send(flatten_message(message(type_, data)))
+        return self.outgoing.put(message(type_, data))
 
     def send_ping(self):
         return self.send('ping', time.time())
@@ -251,13 +271,13 @@ def endpoint(request):
 
     log.debug('spawned avatar %s', avatar.uid)
 
-    while True:
+    channel.run()
+
+    while channel.is_running:
         msg = channel.receive()
-
-        if msg is None:
-            break
-
         World.enqueue(avatar, msg)
+
+    channel.wait()
 
     World.kill(avatar)
 
