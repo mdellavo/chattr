@@ -108,8 +108,8 @@ $(document).ready(function() {
 
         if(this.waypoint) {
             context.beginPath();
-            context.rect(from_tile_pos(this.waypoint[0]),
-                         from_tile_pos(this.waypoint[1]),
+            context.rect(this.waypoint[0] - tile_size/2,
+                         this.waypoint[1] - tile_size/2,
                          tile_size,
                          tile_size);
             context.stroke();
