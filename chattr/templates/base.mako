@@ -7,7 +7,11 @@
        src="http://code.jquery.com/jquery-1.7.1.min.js"></script>
     <script type="text/javascript" src="/static/js/base.js"></script>
     <style type="text/css">
-      body { margin: 0; background: #fff; }
+      html, body {
+         width:  100%;
+         height: 100%;
+         margin: 0px;
+      }
     </style>
   </head>
   <body>

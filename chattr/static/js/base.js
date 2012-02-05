@@ -1,5 +1,40 @@
 $(document).ready(function() {
 
+    var canvas = $('#canvas').get(0);
+    var context = canvas.getContext('2d');
+
+    var width;    
+    var height;
+
+    var tile_size = 32;
+
+    var tiles_wide;
+    var tiles_tall;
+
+    var tiles = {
+        terrain: '/static/img/terrain-tiles.gif',
+        character: '/static/img/character-tiles.gif'
+    };
+
+    function to_tile_pos(i) { return Math.floor(i/tile_size) }
+    function from_tile_pos(i) { return i * tile_size }
+
+    function size() {
+        width = window.innerWidth - 5;
+        height = window.innerHeight - 5;
+
+        tiles_wide = width / tile_size;
+        tiles_tall = height / tile_size;
+
+        console.log('resized: ', width, height);
+        console.log('tiles: ', tiles_wide, tiles_tall);
+
+        context.canvas.width = width;
+        context.canvas.height = height;       
+    }
+
+    $(window).resize(size).resize();
+
     function load_images(sources, progress, complete) {
         var images = {};
         var loaded_images = 0;
@@ -24,33 +59,18 @@ $(document).ready(function() {
         }
     }
 
-    var tile_size = 32;
-    var tiles = {
-        terrain: '/static/img/terrain-tiles.gif',
-        character: '/static/img/character-tiles.gif'
-    };
-
-    function draw_tile(image, tile_size, x, y, dx, dy, dw, dh) {
-        var sx = tile_size * x;
-        var sy = tile_size * y;
+    function draw_tile(image, tile_size, x, y, dx, dy) {
+        var sx = from_tile_pos(x);
+        var sy = from_tile_pos(y);
         var sw = tile_size;
         var sh = tile_size;
+        var dw = tile_size;
+        var dh = tile_size;
         context.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
     }
 
-    var attrs = {
-        'width': $(document).innerWidth(),
-        'height': $(document).innerHeight()
-    };
+    // FIXME monitor resize
 
-    var canvas = $('#canvas').get(0);
-    var context = canvas.getContext('2d');
-
-    var width = $(canvas).innerWidth();    
-    var height = $(canvas).innerHeight();    
-
-    console.log(width, height);
-    
     window.Avatars = {
         avatars: {},
         add: function(avatar) {
@@ -83,12 +103,24 @@ $(document).ready(function() {
     }
 
     Avatar.prototype.draw = function(images) {
-        draw_tile(images.character, tile_size, 0, 0, this.x, this.y, tile_size, tile_size)
+        draw_tile(images.character, tile_size, 0, 0,
+                  this.position[0], this.position[1])
+
+        if(this.waypoint) {
+            context.beginPath();
+            context.rect(from_tile_pos(this.waypoint[0]),
+                         from_tile_pos(this.waypoint[1]),
+                         tile_size,
+                         tile_size);
+            context.stroke();
+        }
+            
+
     } 
  
     Avatar.prototype.clear = function() {
-        context.clearRect(this.x - this.size,
-                          this.y - this.size,
+        context.clearRect(this.position[0] - this.size,
+                          this.position[1] - this.size,
                           this.size * 2, 
                           this.size * 2);
     }
@@ -97,7 +129,6 @@ $(document).ready(function() {
 
     console.log('connecting to', host);
     var socket = new WebSocket(host);
-    var avatar = new Avatar();
 
     function message(type, data) {
         return JSON.stringify({'type': type, 'data': data})
@@ -127,7 +158,6 @@ $(document).ready(function() {
                 Avatars.add(new Avatar(data[i]));
         }, 
         update: function(data) {
-            console.log('update');
             Avatars.get(data.uid).update(data);
         }
     };
@@ -168,6 +198,21 @@ $(document).ready(function() {
             send('input', Keys[evt.keyCode]);
     });
 
+    $(document).mousemove(function(evt) {
+        var tile_x = to_tile_pos(evt.pageX);
+        var tile_y = to_tile_pos(evt.pageY);
+    });
+
+    $(document).click(function(evt) {
+        var tile_x = to_tile_pos(evt.pageX);
+        var tile_y = to_tile_pos(evt.pageY);
+        send('click', [tile_x, tile_y]);
+    });
+
+    $(document).dblclick(function(evt) {
+        send('dblclick', [evt.pageX, evt.pageY]);
+    });
+
     function progress(loaded_images, num_images) {
         console.log('loaded', loaded_images, 'of', num_images);
     }
@@ -177,16 +222,14 @@ $(document).ready(function() {
         function renderer() {
             context.clearRect(0,0,context.canvas.width,context.canvas.height)
 
-            for(var i=0; i<20; i++)
-                for(var j=0; j<20; j++)
+            for(var i=0; i<tiles_tall; i++)
+                for(var j=0; j<tiles_wide; j++)
                     draw_tile(images.terrain,
                               tile_size,
                               0,
                               1,
-                              j * tile_size,
-                              i * tile_size, 
-                              tile_size, 
-                              tile_size);
+                              from_tile_pos(j),
+                              from_tile_pos(i));
 
             Avatars.draw(images);
         }

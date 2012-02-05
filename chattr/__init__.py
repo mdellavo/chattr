@@ -5,7 +5,7 @@
 # Notes
 # 
 # https://developer.valvesoftware.com/wiki/Source_Multiplayer_Networking
-#
+# http://pousse.rapiere.free.fr/tome/tiles/AngbandTk/tome-angbandtktiles.htm
 # -----------------------------------------------------------------------------
 
 from gevent import monkey, Greenlet
@@ -20,6 +20,7 @@ from pyramid.config import Configurator
 from pyramid.view import view_config
 
 import json
+import math
 import logging
 import random
 import time
@@ -154,7 +155,6 @@ class ChannelCollection(object):
 
 
 # FIXME make a greenlet?
-# FIXME mark avatars as dirty
 class MessageHandler(object):
 
     def __init__(self, world):
@@ -187,10 +187,16 @@ class MessageHandler(object):
         }
 
         if data in input_map:
-            dx, dy = input_map.get(data)
-            avatar.move(dx, dy)
+            avatar.move(input_map.get(data))
             avatar.mark_dirty()
 
+    # FIXME select
+    def on_click(self, avatar, data):
+        pass
+
+    def on_dblclick(self, avatar, data):
+        x, y = data
+        avatar.set_waypoint(x, y)
 
 class WorldThread(Greenlet):
 
@@ -242,7 +248,8 @@ class WorldThread(Greenlet):
             now = time.time()
             delta = now - last            
             sleepy_time = max((1.0 / self.TICKRATE)  - delta, 0)
-            log.debug('sleeping world for %s', sleepy_time)
+
+            log.debug('tick took %s, sleeping for %s', delta, sleepy_time)
 
             gevent.sleep(sleepy_time)
 
@@ -262,41 +269,62 @@ class WorldThread(Greenlet):
 World = WorldThread()
 World.start()
 
+difference = lambda xs, ys: [y-x for x, y in zip(xs, ys)]
+magnitude = lambda xs: math.sqrt(sum(x**2 for x in xs))
+distance = lambda xs, ys: magnitude(difference(xs, ys))
+
+def normalize(xs):
+    mag = magnitude(xs)
+    return [i/mag for i in xs]
+
 class Avatar(object):
     def __init__(self):
         self.uid = uuid.uuid4().hex
         self.size = random.randint(5, 20)
-        self.position(random.randint(0, 640),
-                      random.randint(0, 640))
-        self.velocity(0, 0)
+        self.position = [random.randint(0, 640), random.randint(0, 640)]
+        self.velocity = [0, 0]
         self.rotation = 0
         self.dirty = True
         self.ticks = 0
+        self.waypoint = None
 
     def mark_dirty(self):
         self.dirty = True
 
     def mark_clean(self):
         self.dirty = False
-        
+
+    def set_waypoint(self, x, y):
+        self.waypoint = [x, y]
+
     def stat(self):
         exclude = ('ticks', 'dirty')
         return dict((k, v) for k,v in vars(self).items() if k not in exclude)
 
-    def position(self, x, y):
-        self.x = x
-        self.y = y
-
-    def velocity(self, dx, dy):
-        self.dx = dx
-        self.dy = dy
-
-    def move(self, dx, dy):
-        self.x += dx
-        self.y += dy
+    def move(self, vec):
+        for i, n in enumerate(vec):
+            self.position[i] += n
 
     def tick(self, delta):
         self.ticks += 1
+
+        if self.waypoint:
+            dist_to_waypoint = distance(self.position, self.waypoint)
+            
+            if dist_to_waypoint <= 1:
+                self.position = self.waypoint
+                self.waypoint = None
+                self.velocity = [0, 0]
+            elif dist_to_waypoint > 1:
+                dx, dy = normalize(difference(self.position, self.waypoint))
+                self.velocity[0] = dx
+                self.velocity[1] = dy
+
+            self.position[0] += self.velocity[0]
+            self.position[1] += self.velocity[1]
+
+            self.mark_dirty()
+                
 
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):
