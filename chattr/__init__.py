@@ -1,3 +1,13 @@
+# -----------------------------------------------------------------------------
+# 
+# Websocket Server
+#
+# Notes
+# 
+# https://developer.valvesoftware.com/wiki/Source_Multiplayer_Networking
+#
+# -----------------------------------------------------------------------------
+
 from gevent import monkey, Greenlet
 from gevent.queue import Queue, Empty
 from gevent.pywsgi import WSGIServer
@@ -100,9 +110,16 @@ class AvatarCollection(object):
     def all(self):
         return self.avatars.values()
 
-    def tick(self):
+    def tick(self, delta):
         for avatar in self.all():
-            avatar.tick()
+            avatar.tick(delta)
+
+    def dirty(self):
+        return [a for a in self.all() if a.dirty]
+
+    def clean(self):
+        for avatar in self.all():
+            avatar.mark_clean()
 
 class ChannelCollection(object):
     def __init__(self):
@@ -137,6 +154,7 @@ class ChannelCollection(object):
 
 
 # FIXME make a greenlet?
+# FIXME mark avatars as dirty
 class MessageHandler(object):
 
     def __init__(self, world):
@@ -171,7 +189,7 @@ class MessageHandler(object):
         if data in input_map:
             dx, dy = input_map.get(data)
             avatar.move(dx, dy)
-            self.world.channels.broadcast_update(avatar)
+            avatar.mark_dirty()
 
 
 class WorldThread(Greenlet):
@@ -198,11 +216,19 @@ class WorldThread(Greenlet):
         except Empty:
             pass
 
-    def tick(self):
+    # FIXME need to track for updates and fire only one
+    def tick(self, delta):
         for avatar, msg in self.incoming_messages():
             self.message_handler.dispatch(avatar, msg)
             
-        self.avatars.tick()
+        # FIXME track delta
+        self.avatars.tick(delta)
+
+        dirty_avatars = self.avatars.dirty()
+        for avatar in dirty_avatars:
+            self.channels.broadcast_update(avatar)
+        
+        self.avatars.clean()
 
     def _run(self):
         self.running = True
@@ -210,12 +236,12 @@ class WorldThread(Greenlet):
         while self.running:
             last = time.time()
 
-            self.tick()
+            self.tick(0)
             self.ticks += 1
 
             now = time.time()
             delta = now - last            
-            sleepy_time = (1.0 / self.TICKRATE)  - delta
+            sleepy_time = max((1.0 / self.TICKRATE)  - delta, 0)
             log.debug('sleeping world for %s', sleepy_time)
 
             gevent.sleep(sleepy_time)
@@ -240,13 +266,22 @@ class Avatar(object):
     def __init__(self):
         self.uid = uuid.uuid4().hex
         self.size = random.randint(5, 20)
-        self.position(random.randint(0, 100),
-                      random.randint(0, 100))
+        self.position(random.randint(0, 640),
+                      random.randint(0, 640))
         self.velocity(0, 0)
         self.rotation = 0
+        self.dirty = True
+        self.ticks = 0
 
+    def mark_dirty(self):
+        self.dirty = True
+
+    def mark_clean(self):
+        self.dirty = False
+        
     def stat(self):
-        return vars(self)
+        exclude = ('ticks', 'dirty')
+        return dict((k, v) for k,v in vars(self).items() if k not in exclude)
 
     def position(self, x, y):
         self.x = x
@@ -260,8 +295,8 @@ class Avatar(object):
         self.x += dx
         self.y += dy
 
-    def tick(self):
-        pass
+    def tick(self, delta):
+        self.ticks += 1
 
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):

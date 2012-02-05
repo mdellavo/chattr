@@ -1,5 +1,43 @@
 $(document).ready(function() {
 
+    function load_images(sources, progress, complete) {
+        var images = {};
+        var loaded_images = 0;
+        var num_images = 0;
+
+        for(var src in sources)
+            num_images++;
+
+        for(var src in sources) {
+            images[src] = new Image();
+
+            images[src].onload = function() {
+                loaded_images++;
+
+                progress(loaded_images, num_images);
+                
+                if (loaded_images >= num_images)
+                    complete(images);
+            };
+
+            images[src].src = sources[src];
+        }
+    }
+
+    var tile_size = 32;
+    var tiles = {
+        terrain: '/static/img/terrain-tiles.gif',
+        character: '/static/img/character-tiles.gif'
+    };
+
+    function draw_tile(image, tile_size, x, y, dx, dy, dw, dh) {
+        var sx = tile_size * x;
+        var sy = tile_size * y;
+        var sw = tile_size;
+        var sh = tile_size;
+        context.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+
     var attrs = {
         'width': $(document).innerWidth(),
         'height': $(document).innerHeight()
@@ -10,8 +48,7 @@ $(document).ready(function() {
 
     var width = $(canvas).innerWidth();    
     var height = $(canvas).innerHeight();    
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.clearRect(0, 0, width, height);
+
     console.log(width, height);
     
     window.Avatars = {
@@ -30,9 +67,9 @@ $(document).ready(function() {
             for(var uid in this.avatars)
                 this.avatars[uid].clear();
         },
-        draw: function() {
+        draw: function(images) {
             for(var uid in this.avatars)
-                this.avatars[uid].draw();
+                this.avatars[uid].draw(images);
         }
     };
 
@@ -45,10 +82,8 @@ $(document).ready(function() {
             this[i] = data[i];
     }
 
-    Avatar.prototype.draw = function() {
-        context.beginPath()
-        context.arc(this.x, this.y, this.size, 0, Math.PI * 2, true);
-        context.stroke();
+    Avatar.prototype.draw = function(images) {
+        draw_tile(images.character, tile_size, 0, 0, this.x, this.y, tile_size, tile_size)
     } 
  
     Avatar.prototype.clear = function() {
@@ -58,18 +93,9 @@ $(document).ready(function() {
                           this.size * 2);
     }
 
+    var host = 'ws://' + window.location.host + '/end-point'
 
-    var Keys = {
-        32: 'SPACE',
-        13: 'ENTER',
-        27: 'ESC',
-        37: 'LEFT',
-        38: 'UP',
-        39: 'RIGHT',
-        40: 'DOWN'
-    };
-
-    var host = 'ws://localhost:6543/end-point'
+    console.log('connecting to', host);
     var socket = new WebSocket(host);
     var avatar = new Avatar();
 
@@ -88,8 +114,7 @@ $(document).ready(function() {
         },
         spawn: function(data) {
             console.log('spawn');
-            var avatar = new Avatar(data);
-            Avatars.add(avatar);
+            Avatars.add(new Avatar(data));
         },        
         die: function(data) {
             console.log('die');
@@ -99,7 +124,7 @@ $(document).ready(function() {
             console.log('state');
 
             for(var i=0; i<data.length; i++)
-                Avatars.add(data[i]);
+                Avatars.add(new Avatar(data[i]));
         }, 
         update: function(data) {
             console.log('update');
@@ -127,17 +152,48 @@ $(document).ready(function() {
     socket.onerror = function() {
         console.log('error');
     };
-    
-    function renderer() {
-        //Avatars.clear();
-        context.clearRect(0,0,context.canvas.width,context.canvas.height)
-        Avatars.draw();
-    }
-    window.setInterval(renderer, 50);
+
+    var Keys = {
+        32: 'SPACE',
+        13: 'ENTER',
+        27: 'ESC',
+        37: 'LEFT',
+        38: 'UP',
+        39: 'RIGHT',
+        40: 'DOWN'
+    };
 
     $(document).keydown(function(evt) {
         if(evt.keyCode in Keys)
             send('input', Keys[evt.keyCode]);
     });
 
+    function progress(loaded_images, num_images) {
+        console.log('loaded', loaded_images, 'of', num_images);
+    }
+    
+    function main(images) {
+
+        function renderer() {
+            context.clearRect(0,0,context.canvas.width,context.canvas.height)
+
+            for(var i=0; i<20; i++)
+                for(var j=0; j<20; j++)
+                    draw_tile(images.terrain,
+                              tile_size,
+                              0,
+                              1,
+                              j * tile_size,
+                              i * tile_size, 
+                              tile_size, 
+                              tile_size);
+
+            Avatars.draw(images);
+        }
+
+        window.setInterval(renderer, 50);
+    }
+    
+    load_images(tiles, progress, main);
+    
 });
