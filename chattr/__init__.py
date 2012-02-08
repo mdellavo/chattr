@@ -20,17 +20,24 @@ from pyramid.config import Configurator
 from pyramid.view import view_config
 
 import json
-import math
 import logging
 import random
 import time
 import uuid
-from collections import namedtuple
+
+from chattr.vector import Vector
 
 log = logging.getLogger(__name__)
 
+
+def json_encoder(obj):
+    if hasattr(obj, '__json__'):
+        return obj.__json__()
+
+    raise TypeError('%s is not JSON serializable' % obj)
+
 message = lambda type_, data=None: {'type': type_, 'data': data}
-flatten_message = lambda msg: json.dumps(msg)
+flatten_message = lambda msg: json.dumps(msg, default=json_encoder)
 parse_message = lambda data: json.loads(data)
 
 
@@ -88,22 +95,22 @@ class Channel(object):
         return self.send('notice', msg)
 
     def send_spawn(self, avatar):
-        return self.send('spawn', avatar.stat())
+        return self.send('spawn', avatar)
 
     def send_die(self, avatar):
         return self.send('die', avatar.uid)
 
     def send_tiles(self, tiles):
-        return self.send('tiles', [i.to_dict() for i in tiles])
+        return self.send('tiles', tiles)
 
     def send_chunk(self, chunk):
         return self.send('chunk', list(chunk))
 
     def send_state(self, avatars):
-        return self.send('state', [i.stat() for i in avatars])
+        return self.send('state', avatars)
 
     def send_update(self, avatar):
-        return self.send('update', avatar.stat())
+        return self.send('update', avatar)
 
 
 class AvatarCollection(object):
@@ -178,6 +185,9 @@ class Tile(object):
         self.h = h
         self.flags = set(flags or '')
 
+    def __json__(self):
+        return self.to_dict()
+
     def to_dict(self):
         return dict((k, v) for k, v in vars(self).items() if k != 'flags')
 
@@ -235,13 +245,14 @@ class MessageHandler(object):
     def on_spawn(self, avatar, data):
         channel = self.world.channels.get(avatar)
 
-        channel.send_tiles(self.world.map.tiles)
-        channel.send_chunk(self.world.map.chunk(avatar.position[0]/32, avatar.position[1]/32, 50))
-        channel.send_state(self.world.avatars.all())
+        if channel:
+            channel.send_tiles(self.world.map.tiles)
+            channel.send_chunk(self.world.map.chunk(avatar.position[0] / 32,
+                                                    avatar.position[1] / 32, 50))
+            channel.send_state(self.world.avatars.all())
 
         msg = 'The server welcomes avatar %s to the world!' % avatar.uid
         self.world.channels.broadcast_notice(msg)
-
         self.world.channels.broadcast_spawn(avatar)
 
     def on_die(self, avatar, data):
@@ -249,10 +260,10 @@ class MessageHandler(object):
 
     def on_input(self, avatar, data):
         input_map = {
-            'UP': (0, -1),
-            'DOWN': (0, 1),
-            'LEFT': (-1, 0),
-            'RIGHT': (1, 0)
+            'UP': Vector(0, -1),
+            'DOWN': Vector(0, 1),
+            'LEFT': Vector(-1, 0),
+            'RIGHT': Vector(1, 0)
         }
 
         if data in input_map:
@@ -265,7 +276,7 @@ class MessageHandler(object):
 
     def on_dblclick(self, avatar, data):
         x, y = data
-        avatar.set_waypoint(x, y)
+        avatar.set_waypoint(Vector(x, y))
 
 
 class WorldThread(Greenlet):
@@ -324,10 +335,10 @@ class WorldThread(Greenlet):
 
             gevent.sleep(sleepy_time)
 
-    def spawn(self, channel):
-        avatar = Avatar()
+    def spawn(self, avatar, channel=None):
         self.avatars.add(avatar)
-        self.channels.add(avatar, channel)
+        if channel:
+            self.channels.add(avatar, channel)
         self.enqueue(avatar, message('spawn'))
         return avatar
 
@@ -340,28 +351,20 @@ class WorldThread(Greenlet):
 World = WorldThread(Map.load('map.json'))
 
 
-# FIXME need a Pair class with vector ops
-difference = lambda xs, ys: [y - x for x, y in zip(xs, ys)]
-magnitude = lambda xs: math.sqrt(sum(x ** 2 for x in xs))
-distance = lambda xs, ys: magnitude(difference(xs, ys))
-
-
-def normalize(xs):
-    mag = magnitude(xs)
-    return [i / mag for i in xs]
-
-
 # FIXME limit map chunk by vision
 class Avatar(object):
     def __init__(self):
         self.uid = uuid.uuid4().hex
         self.size = random.randint(5, 20)
-        self.position = [random.randint(0, 640), random.randint(0, 640)]
-        self.velocity = [0, 0]
+        self.position = Vector(random.randint(0, 640), random.randint(0, 640))
+        self.velocity = Vector()
         self.rotation = 0
         self.dirty = True
         self.ticks = 0
         self.waypoint = None
+
+    def __json__(self):
+        return self.stat()
 
     def mark_dirty(self):
         self.dirty = True
@@ -369,34 +372,30 @@ class Avatar(object):
     def mark_clean(self):
         self.dirty = False
 
-    def set_waypoint(self, x, y):
-        self.waypoint = [x, y]
+    def set_waypoint(self, vec):
+        self.waypoint = vec
 
     def stat(self):
         exclude = ('ticks', 'dirty')
         return dict((k, v) for k, v in vars(self).items() if k not in exclude)
 
     def move(self, vec):
-        for i, n in enumerate(vec):
-            self.position[i] += n
+        self.position += vec
 
     def tick(self, delta):
         self.ticks += 1
 
         if self.waypoint:
-            dist_to_waypoint = distance(self.position, self.waypoint)
+            dist_to_waypoint = self.position.distance(self.waypoint)
 
             if dist_to_waypoint <= 1:
                 self.position = self.waypoint
+                self.velocity.zero()
                 self.waypoint = None
-                self.velocity = [0, 0]
             elif dist_to_waypoint > 1:
-                dx, dy = normalize(difference(self.position, self.waypoint))
-                self.velocity[0] = dx
-                self.velocity[1] = dy
+                self.velocity = (self.waypoint - self.position).normalize()
 
-            self.position[0] += self.velocity[0]
-            self.position[1] += self.velocity[1]
+            self.position += self.velocity
 
             self.mark_dirty()
 
@@ -405,11 +404,25 @@ class NPCAvatar(Avatar):
     pass
 
 
+class Wanderer(NPCAvatar):
+    def __init__(self, range):
+        super(Wanderer, self).__init__()
+        self.range = range
+
+    def tick(self, delta):
+        if not self.waypoint:
+            tmp = Vector(random.randint(-self.range, self.range),
+                         random.randint(-self.range, self.range))
+            self.waypoint = self.position + tmp
+
+        super(Wanderer, self).tick(delta)
+
+
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):
-
+    avatar = Avatar()
     channel = Channel(request.environ['wsgi.websocket'])
-    avatar = World.spawn(channel)
+    World.spawn(avatar, channel)
 
     log.debug('spawned avatar %s', avatar.uid)
 
@@ -455,5 +468,8 @@ def main(global_config, **settings):
 
     log.info('Starting the world')
     World.start()
+
+    for i in range(20):
+        World.spawn(Wanderer(20))
 
     return config.make_wsgi_app()
