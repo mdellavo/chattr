@@ -1,4 +1,47 @@
 $(document).ready(function() {
+    
+    window.Log = {
+        el: $('#messages'),
+        init: function() {
+            var el = this.el[0];           
+            el.onmousedown = el.onselectstart = function(){ return false }
+
+            // FIXME test 
+            console.log = function() {
+                var log = console.log;
+                return function() {
+                    Log.debug.apply(Log, arguments);
+                    log.apply(this, arguments);
+                }
+            }()
+
+        },
+        trim: function() {
+            var messages = this.el.find('li');
+            var max_messages = 20;
+            messages.slice(0, -(max_messages-1)).remove();
+            messages.each(function(i, ele) {
+                var num = 2 * Math.min(messages.length, max_messages);
+                var opacity = (1 / num) * (i + 1) + .5;
+                $(ele).css('opacity', opacity);
+            });
+        },
+        add: function(msg, cls) { 
+            cls = cls || '';
+            this.el.append('<li class="' + cls + '">' + msg + '</li>');
+            this.trim();
+        },
+        debug: function() {
+            var prefix = '<span class="label">Debug:</span>';
+            var args = [].splice.call(arguments, 0);           
+            this.add(prefix + args.join(' '), 'debug');
+        },
+        notice: function(msg) {
+            this.add('* ' + msg, 'notice');
+        }
+    };
+    
+    Log.init();
 
     var canvas = $('#canvas').get(0);
     var context = canvas.getContext('2d');
@@ -23,8 +66,8 @@ $(document).ready(function() {
         width = window.innerWidth - 5;
         height = window.innerHeight - 5;
 
-        tiles_wide = width / tile_size;
-        tiles_tall = height / tile_size;
+        tiles_wide = Math.ceil(width / tile_size);
+        tiles_tall = Math.ceil(height / tile_size);
 
         console.log('resized: ', width, height);
         console.log('tiles: ', tiles_wide, tiles_tall);
@@ -49,7 +92,7 @@ $(document).ready(function() {
             images[src].onload = function() {
                 loaded_images++;
 
-                progress(loaded_images, num_images);
+                progress(src, loaded_images, num_images);
                 
                 if (loaded_images >= num_images)
                     complete(images);
@@ -68,8 +111,6 @@ $(document).ready(function() {
         var dh = tile_size;
         context.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
     }
-
-    // FIXME monitor resize
 
     window.Avatars = {
         avatars: {},
@@ -104,7 +145,8 @@ $(document).ready(function() {
 
     Avatar.prototype.draw = function(images) {
         draw_tile(images.character, tile_size, 0, 0,
-                  this.position[0], this.position[1])
+                  this.position[0] - tile_size/2,
+                  this.position[1] - tile_size/2)
 
         if(this.waypoint) {
             context.beginPath();
@@ -125,9 +167,38 @@ $(document).ready(function() {
                           this.size * 2);
     }
 
+    function MapChunk() {
+        this.tiles = null;
+        this.chunk = null;
+    }
+
+    MapChunk.prototype.set_tiles = function(tiles) {
+        this.tiles = tiles;
+    }
+
+    MapChunk.prototype.update = function(chunk) {
+        this.chunk = chunk;
+    }
+
+    MapChunk.prototype.draw = function(images) {
+        for(var i=0; i<this.chunk.length; i++) {
+            for(var j=0; j<this.chunk[i].length; j++) {
+                var tile = this.tiles[this.chunk[i][j]];
+                draw_tile(images.terrain,
+                          tile.w,
+                          tile.x,
+                          tile.y,
+                          from_tile_pos(j),
+                          from_tile_pos(i));
+            }
+        }
+    }
+
+    window.Map = new MapChunk();
+    
     var host = 'ws://' + window.location.host + '/end-point'
 
-    console.log('connecting to', host);
+    console.log('opening websocket to', host);
     var socket = new WebSocket(host);
 
     function message(type, data) {
@@ -142,6 +213,17 @@ $(document).ready(function() {
         ping: function(data) {
             console.log('pong');
             send('pong', data);
+        },
+        notice: function(data) {
+            Log.notice(data);
+        },
+        tiles: function(data) {
+            console.log('tiles');
+            Map.set_tiles(data);
+        },
+        chunk: function(data) {
+            console.log('chunk');
+            Map.update(data);
         },
         spawn: function(data) {
             console.log('spawn');
@@ -163,7 +245,7 @@ $(document).ready(function() {
     };
    
     socket.onopen = function(msg) {
-        console.log('open');
+        console.log('websocket opened');
     };
     
     socket.onmessage = function(msg) {
@@ -176,11 +258,11 @@ $(document).ready(function() {
     };
 
     socket.onclose = function() {
-        console.log('close');
+        console.log('websocket closed');
     };
 
     socket.onerror = function() {
-        console.log('error');
+        console.log('websocket error');
     };
 
     var Keys = {
@@ -194,8 +276,11 @@ $(document).ready(function() {
     };
 
     $(document).keydown(function(evt) {
-        if(evt.keyCode in Keys)
-            send('input', Keys[evt.keyCode]);
+        if(evt.keyCode in Keys) {
+            var key = Keys[evt.keyCode]
+            console.log('pressed', key)
+            send('input', key);
+        }
     });
 
     $(document).mousemove(function(evt) {
@@ -206,37 +291,31 @@ $(document).ready(function() {
     $(document).click(function(evt) {
         var tile_x = to_tile_pos(evt.pageX);
         var tile_y = to_tile_pos(evt.pageY);
+        console.log('clicked', evt.pageX, ',', evt.pageY)
         send('click', [tile_x, tile_y]);
     });
 
     $(document).dblclick(function(evt) {
+        console.log('double clicked', evt.pageX, ',', evt.pageY)
         send('dblclick', [evt.pageX, evt.pageY]);
     });
 
-    function progress(loaded_images, num_images) {
-        console.log('loaded', loaded_images, 'of', num_images);
+    function progress(src, loaded_images, num_images) {
+        console.log('loaded', loaded_images, 'of', num_images, ':', src);
     }
     
     function main(images) {
 
         function renderer() {
-            context.clearRect(0,0,context.canvas.width,context.canvas.height)
-
-            for(var i=0; i<tiles_tall; i++)
-                for(var j=0; j<tiles_wide; j++)
-                    draw_tile(images.terrain,
-                              tile_size,
-                              0,
-                              1,
-                              from_tile_pos(j),
-                              from_tile_pos(i));
-
+            context.clearRect(0, 0, context.canvas.width, context.canvas.height)
+            Map.draw(images);
             Avatars.draw(images);
         }
 
         window.setInterval(renderer, 50);
     }
-    
+
+    console.log('loading images...')
     load_images(tiles, progress, main);
     
 });

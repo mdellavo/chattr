@@ -4,3 +4,7 @@ pyramid
 pyramid_debugtoolbar
 paste
 pastescript
+
+# See README for workaround
+numpy
+matplotlib

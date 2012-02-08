@@ -1,9 +1,9 @@
 # -----------------------------------------------------------------------------
-# 
+#
 # Websocket Server
 #
 # Notes
-# 
+#
 # https://developer.valvesoftware.com/wiki/Source_Multiplayer_Networking
 # http://pousse.rapiere.free.fr/tome/tiles/AngbandTk/tome-angbandtktiles.htm
 # -----------------------------------------------------------------------------
@@ -25,6 +25,7 @@ import logging
 import random
 import time
 import uuid
+from collections import namedtuple
 
 log = logging.getLogger(__name__)
 
@@ -32,13 +33,14 @@ message = lambda type_, data=None: {'type': type_, 'data': data}
 flatten_message = lambda msg: json.dumps(msg)
 parse_message = lambda data: json.loads(data)
 
+
 # FIXME throttle incoming/outgoing
 class Channel(object):
     def __init__(self, socket):
         self.socket = socket
 
         self.running = False
-        
+
         self.incoming = Queue(None)
         self.outgoing = Queue(None)
 
@@ -60,9 +62,9 @@ class Channel(object):
             msg = self.outgoing.get()
             self.socket.send(flatten_message(msg))
 
-    def is_running():
-        return self.running and not any([self.reader.ready(), 
-                                         self.writier.ready()])
+    def is_running(self):
+        return self.running and not any([self.reader.ready(),
+                                         self.writer.ready()])
 
     def run(self):
         self.running = True
@@ -82,11 +84,20 @@ class Channel(object):
     def send_ping(self):
         return self.send('ping', time.time())
 
+    def send_notice(self, msg):
+        return self.send('notice', msg)
+
     def send_spawn(self, avatar):
         return self.send('spawn', avatar.stat())
 
     def send_die(self, avatar):
         return self.send('die', avatar.uid)
+
+    def send_tiles(self, tiles):
+        return self.send('tiles', [i.to_dict() for i in tiles])
+
+    def send_chunk(self, chunk):
+        return self.send('chunk', list(chunk))
 
     def send_state(self, avatars):
         return self.send('state', [i.stat() for i in avatars])
@@ -122,6 +133,7 @@ class AvatarCollection(object):
         for avatar in self.all():
             avatar.mark_clean()
 
+
 class ChannelCollection(object):
     def __init__(self):
         self.channels = dict()
@@ -144,6 +156,9 @@ class ChannelCollection(object):
         for uid in self.channels:
             method(self.channels[uid], *args, **kwargs)
 
+    def broadcast_notice(self, msg):
+        self.broadcast(Channel.send_notice, msg)
+
     def broadcast_spawn(self, avatar):
         self.broadcast(Channel.send_spawn, avatar)
 
@@ -154,7 +169,53 @@ class ChannelCollection(object):
         self.broadcast(Channel.send_update, avatar)
 
 
+class Tile(object):
+    def __init__(self, name, x, y, w, h, flags=None):
+        self.name = name
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.flags = set(flags or '')
+
+    def to_dict(self):
+        return dict((k, v) for k, v in vars(self).items() if k != 'flags')
+
+
+class Map(object):
+    def __init__(self, tiles, data, tile_map):
+        self.tiles = tiles
+        self.data = data
+        self.tile_map = tile_map
+
+    @classmethod
+    def load(cls, path):
+        rv = None
+
+        with open(path) as f:
+            obj = json.load(f)
+
+            tiles = [Tile(**i) for i in obj['tiles']]
+            data = obj['data']
+            tile_map = obj['tile_map']
+
+            rv = cls(tiles, data, tile_map)
+
+        return rv
+
+    def get(self, x, y):
+        return self.tiles[self.data[y][x]]
+
+    def chunk(self, x, y, s):
+        px = max(x - s / 2, 0)
+        py = max(y - s / 2, 0)
+
+        for i in range(py, py + s):
+            yield self.data[i][px:px + s]
+
+
 # FIXME make a greenlet?
+# FIXME map chunk size
 class MessageHandler(object):
 
     def __init__(self, world):
@@ -171,11 +232,19 @@ class MessageHandler(object):
 
         return handler is not None
 
-    def on_spawn(self, avatar, data):        
-        self.world.channels.get(avatar).send_state(self.world.avatars.all())
+    def on_spawn(self, avatar, data):
+        channel = self.world.channels.get(avatar)
+
+        channel.send_tiles(self.world.map.tiles)
+        channel.send_chunk(self.world.map.chunk(avatar.position[0]/32, avatar.position[1]/32, 50))
+        channel.send_state(self.world.avatars.all())
+
+        msg = 'The server welcomes avatar %s to the world!' % avatar.uid
+        self.world.channels.broadcast_notice(msg)
+
         self.world.channels.broadcast_spawn(avatar)
 
-    def on_die(self, avarar, data):
+    def on_die(self, avatar, data):
         self.world.channels.broadcast_die(avatar)
 
     def on_input(self, avatar, data):
@@ -198,12 +267,14 @@ class MessageHandler(object):
         x, y = data
         avatar.set_waypoint(x, y)
 
+
 class WorldThread(Greenlet):
 
     TICKRATE = 10
 
-    def __init__(self):
+    def __init__(self, map):
         super(WorldThread, self).__init__()
+        self.map = map
         self.running = False
         self.ticks = 0
         self.input = Queue(None)
@@ -222,18 +293,16 @@ class WorldThread(Greenlet):
         except Empty:
             pass
 
-    # FIXME need to track for updates and fire only one
     def tick(self, delta):
         for avatar, msg in self.incoming_messages():
             self.message_handler.dispatch(avatar, msg)
-            
-        # FIXME track delta
+
         self.avatars.tick(delta)
 
         dirty_avatars = self.avatars.dirty()
         for avatar in dirty_avatars:
             self.channels.broadcast_update(avatar)
-        
+
         self.avatars.clean()
 
     def _run(self):
@@ -242,14 +311,16 @@ class WorldThread(Greenlet):
         while self.running:
             last = time.time()
 
+            # FIXME track delta
+
             self.tick(0)
             self.ticks += 1
 
             now = time.time()
-            delta = now - last            
-            sleepy_time = max((1.0 / self.TICKRATE)  - delta, 0)
+            delta = now - last
+            sleepy_time = max((1.0 / self.TICKRATE) - delta, 0)
 
-            log.debug('tick took %s, sleeping for %s', delta, sleepy_time)
+            #log.debug('tick took %s, sleeping for %s', delta, sleepy_time)
 
             gevent.sleep(sleepy_time)
 
@@ -259,24 +330,28 @@ class WorldThread(Greenlet):
         self.channels.add(avatar, channel)
         self.enqueue(avatar, message('spawn'))
         return avatar
-        
+
     def die(self, avatar):
         self.channels.remove(avatar)
         self.avatars.remove(avatar)
         self.enqueue(avatar, message('die'))
-    
 
-World = WorldThread()
-World.start()
 
-difference = lambda xs, ys: [y-x for x, y in zip(xs, ys)]
-magnitude = lambda xs: math.sqrt(sum(x**2 for x in xs))
+World = WorldThread(Map.load('map.json'))
+
+
+# FIXME need a Pair class with vector ops
+difference = lambda xs, ys: [y - x for x, y in zip(xs, ys)]
+magnitude = lambda xs: math.sqrt(sum(x ** 2 for x in xs))
 distance = lambda xs, ys: magnitude(difference(xs, ys))
+
 
 def normalize(xs):
     mag = magnitude(xs)
-    return [i/mag for i in xs]
+    return [i / mag for i in xs]
 
+
+# FIXME limit map chunk by vision
 class Avatar(object):
     def __init__(self):
         self.uid = uuid.uuid4().hex
@@ -299,7 +374,7 @@ class Avatar(object):
 
     def stat(self):
         exclude = ('ticks', 'dirty')
-        return dict((k, v) for k,v in vars(self).items() if k not in exclude)
+        return dict((k, v) for k, v in vars(self).items() if k not in exclude)
 
     def move(self, vec):
         for i, n in enumerate(vec):
@@ -310,7 +385,7 @@ class Avatar(object):
 
         if self.waypoint:
             dist_to_waypoint = distance(self.position, self.waypoint)
-            
+
             if dist_to_waypoint <= 1:
                 self.position = self.waypoint
                 self.waypoint = None
@@ -324,7 +399,11 @@ class Avatar(object):
             self.position[1] += self.velocity[1]
 
             self.mark_dirty()
-                
+
+
+class NPCAvatar(Avatar):
+    pass
+
 
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):
@@ -347,6 +426,7 @@ def endpoint(request):
     log.debug('killed avatar %s', avatar.uid)
 
     return ''
+
 
 @view_config(route_name='root', renderer='/base.mako')
 def root(request):
@@ -372,5 +452,8 @@ def main(global_config, **settings):
     config.add_route('endpoint', '/end-point')
 
     config.scan()
+
+    log.info('Starting the world')
+    World.start()
 
     return config.make_wsgi_app()
