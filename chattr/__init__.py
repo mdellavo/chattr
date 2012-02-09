@@ -247,8 +247,8 @@ class MessageHandler(object):
 
         if channel:
             channel.send_tiles(self.world.map.tiles)
-            channel.send_chunk(self.world.map.chunk(avatar.position[0] / 32,
-                                                    avatar.position[1] / 32, 50))
+            channel.send_chunk(self.world.map.chunk(avatar.position.x / 32,
+                                                    avatar.position.y / 32, 50))
             channel.send_state(self.world.avatars.all())
 
         msg = 'The server welcomes avatar %s to the world!' % avatar.uid
@@ -335,21 +335,26 @@ class WorldThread(Greenlet):
 
             gevent.sleep(sleepy_time)
 
-    def spawn(self, avatar, channel=None):
+    def spawn(self, cls=None, args=None, kwargs=None):
+        cls = cls or Avatar
+        args = args or ()
+        kwargs = kwargs or {}
+
+        avatar = cls(*args, **kwargs)
         self.avatars.add(avatar)
-        if channel:
-            self.channels.add(avatar, channel)
         self.enqueue(avatar, message('spawn'))
         return avatar
 
-    def die(self, avatar):
+    def attach(self, avatar, channel):
+        self.channels.add(avatar, channel)
+
+    def detach(self, avatar):
+        self.channels.remove(avatar)
+
+    def kill(self, avatar):
         self.channels.remove(avatar)
         self.avatars.remove(avatar)
         self.enqueue(avatar, message('die'))
-
-
-World = WorldThread(Map.load('map.json'))
-
 
 # FIXME limit map chunk by vision
 class Avatar(object):
@@ -418,11 +423,15 @@ class Wanderer(NPCAvatar):
         super(Wanderer, self).tick(delta)
 
 
+World = WorldThread(Map.load('map.json'))
+
+
 @view_config(route_name='endpoint', renderer='string')
 def endpoint(request):
-    avatar = Avatar()
+    avatar = World.spawn()
     channel = Channel(request.environ['wsgi.websocket'])
-    World.spawn(avatar, channel)
+
+    World.attach(avatar, channel)
 
     log.debug('spawned avatar %s', avatar.uid)
 
@@ -434,6 +443,7 @@ def endpoint(request):
 
     channel.wait()
 
+    World.detach(avatar)
     World.kill(avatar)
 
     log.debug('killed avatar %s', avatar.uid)
@@ -470,6 +480,6 @@ def main(global_config, **settings):
     World.start()
 
     for i in range(20):
-        World.spawn(Wanderer(20))
+        World.spawn(Wanderer, args=(100,))
 
     return config.make_wsgi_app()
