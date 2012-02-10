@@ -56,6 +56,7 @@ class Channel(object):
 
         self.reader = Greenlet(self.do_read)
         self.writer = Greenlet(self.do_write)
+        self.pinger = Greenlet(self.do_ping)
 
     def do_read(self):
         while self.running:
@@ -92,6 +93,7 @@ class Channel(object):
         self.running = True
         self.reader.start()
         self.writer.start()
+        self.pinger.start()
 
     def wait(self):
         self.running = False
@@ -126,6 +128,12 @@ class Channel(object):
 
     def send_update(self, avatar):
         return self.send('update', avatar)
+
+    def do_ping(self):
+        while self.running:
+            gevent.sleep(10)
+            log.debug('pinging')
+            self.send_ping()
 
 
 class AvatarCollection(object):
@@ -266,6 +274,9 @@ class MessageHandler(object):
 
         return handler is not None
 
+    def on_pong(self, avatar, data):
+        log.debug('ponged: %s', time.time() - data)
+
     def on_spawn(self, avatar, data):
         channel = self.world.channels.get(avatar)
 
@@ -301,8 +312,8 @@ class MessageHandler(object):
 
 
 class WorldThread(Greenlet):
-
-    TICKRATE = 1.0 / 10.0
+    TPS = 10.0
+    SKIP_TICKS = 1000.0 / TPS
 
     def __init__(self, map):
         super(WorldThread, self).__init__()
@@ -341,34 +352,34 @@ class WorldThread(Greenlet):
     def _run(self):
         self.running = True
 
-        next_tick = time.time()
+        get_ticks = lambda: time.time() * 1000.0
+        next_tick = get_ticks()
 
-        next_fps = time.time()
-        last_fps = time.time()
+        next_fps = get_ticks() - 1
+        last_fps = get_ticks() - 1
         fps_filter = 1.0
         fps = 0.0
 
         while self.running:
-            now = time.time()
+            self.tick(self.SKIP_TICKS)
+            self.ticks += 1
 
-            if now >= next_tick:
-                self.tick(self.TICKRATE)
-                self.ticks += 1
-                next_tick += self.TICKRATE
+            next_tick += self.SKIP_TICKS
 
-                if now >= next_fps:
-                    frame_fps = 100.0 / (now - last_fps)
-                    fps += ((frame_fps - fps) / fps_filter)
-                    #log.debug('ticks per second: %.02f', fps)
-                    last_fps = now
-                    next_fps += 10
+            now = get_ticks()
+            sleep_time = next_tick - now
 
-            else:
-                sleep_time = next_tick - now
+            if sleep_time > 0:
+                #log.debug('sleeping for %.02f', sleep_time)
+                gevent.sleep(sleep_time / 1000.0)
 
-                if sleep_time > 0:
-                    #log.debug('sleeping for %.02f', sleep_time)
-                    gevent.sleep(sleep_time)
+            if now >= next_fps:
+                frame_fps = self.TPS * 1000 / (now - last_fps)
+                fps += ((frame_fps - fps) / fps_filter)
+
+                #log.debug('ticks per second: %.02f', fps)
+                last_fps = now
+                next_fps += 1000
 
     def spawn(self, cls=None, args=None, kwargs=None):
         cls = cls or Avatar
@@ -457,16 +468,17 @@ class Wanderer(NPC):
         super(Wanderer, self).__init__()
         self.range = range
         self.rest = 0
-        
+
     def tick(self, delta):
 
-        if not self.waypoint and self.rest <= 0:
-            tmp = Vector(random.randint(-self.range, self.range),
-                         random.randint(-self.range, self.range))
-            self.waypoint = self.position + tmp
-            self.rest = random.randint(3, 10)
-        elif self.rest > 0:
-            self.rest -= delta
+        if not self.waypoint:
+            if self.rest <= 0:
+                tmp = Vector(random.randint(-self.range, self.range),
+                             random.randint(-self.range, self.range))
+                self.waypoint = self.position + tmp
+                self.rest = random.randint(1500, 3000)
+            else:
+                self.rest -= delta
 
         super(Wanderer, self).tick(delta)
 
