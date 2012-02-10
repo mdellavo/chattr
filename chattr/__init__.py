@@ -6,6 +6,7 @@
 #
 # https://developer.valvesoftware.com/wiki/Source_Multiplayer_Networking
 # http://pousse.rapiere.free.fr/tome/tiles/AngbandTk/tome-angbandtktiles.htm
+# http://code.google.com/p/canvasimagegradient/source/browse/trunk/canvasImageGradient.js
 # -----------------------------------------------------------------------------
 
 from gevent import monkey, Greenlet
@@ -14,7 +15,7 @@ from gevent.pywsgi import WSGIServer
 import gevent
 monkey.patch_all()
 
-from geventwebsocket.handler import WebSocketHandler
+from geventwebsocket import WebSocketHandler, WebSocketError
 
 from pyramid.config import Configurator
 from pyramid.view import view_config
@@ -24,6 +25,8 @@ import logging
 import random
 import time
 import uuid
+import code
+import signal
 
 from chattr.vector import Vector
 
@@ -61,13 +64,25 @@ class Channel(object):
             if not data:
                 break
 
-            if data:
+            try:
                 self.incoming.put(parse_message(data))
+            except WebSocketError, e:
+                log.error('Error receiving on websocket: %s', e)
+                self.running = False
+                self.outgoing.put(None)
 
     def do_write(self):
         while self.running:
-            msg = self.outgoing.get()
-            self.socket.send(flatten_message(msg))
+            try:
+                msg = self.outgoing.get()
+                if not msg:
+                    break
+
+                self.socket.send(flatten_message(msg))
+            except WebSocketError, e:
+                log.error('Error sending on websocket: %s', e)
+                self.running = False
+                self.incoming.put(None)
 
     def is_running(self):
         return self.running and not any([self.reader.ready(),
@@ -121,7 +136,8 @@ class AvatarCollection(object):
         self.avatars[avatar.uid] = avatar
 
     def remove(self, avatar):
-        del self.avatars[avatar.uid]
+        if avatar.uid in self.avatars:
+            del self.avatars[avatar.uid]
 
     def get(self, uid):
         return self.avatars.get(uid)
@@ -149,7 +165,8 @@ class ChannelCollection(object):
         self.channels[avatar.uid] = channel
 
     def remove(self, avatar):
-        del self.channels[avatar.uid]
+        if avatar.uid in self.channels:
+            del self.channels[avatar.uid]
 
     def get(self, o):
         if isinstance(o, Avatar):
@@ -192,11 +209,13 @@ class Tile(object):
         return dict((k, v) for k, v in vars(self).items() if k != 'flags')
 
 
+# FIXME switch to Point for coords
 class Map(object):
-    def __init__(self, tiles, data, tile_map):
+    def __init__(self, tiles, data, tile_map, tile_size=32):
         self.tiles = tiles
         self.data = data
         self.tile_map = tile_map
+        self.tile_size = tile_size
 
     @classmethod
     def load(cls, path):
@@ -213,10 +232,15 @@ class Map(object):
 
         return rv
 
-    def get(self, x, y):
+    def position(self, p):
+        return p.copy() / self.tile_size
+
+    def get(self, position):
+        x, y = self.position(position)
         return self.tiles[self.data[y][x]]
 
-    def chunk(self, x, y, s):
+    def chunk(self, position, s):
+        x, y = self.position(position)
         px = max(x - s / 2, 0)
         py = max(y - s / 2, 0)
 
@@ -247,8 +271,7 @@ class MessageHandler(object):
 
         if channel:
             channel.send_tiles(self.world.map.tiles)
-            channel.send_chunk(self.world.map.chunk(avatar.position.x / 32,
-                                                    avatar.position.y / 32, 50))
+            channel.send_chunk(self.world.map.chunk(avatar.position, 50))
             channel.send_state(self.world.avatars.all())
 
         msg = 'The server welcomes avatar %s to the world!' % avatar.uid
@@ -259,12 +282,10 @@ class MessageHandler(object):
         self.world.channels.broadcast_die(avatar)
 
     def on_input(self, avatar, data):
-        input_map = {
-            'UP': Vector(0, -1),
-            'DOWN': Vector(0, 1),
-            'LEFT': Vector(-1, 0),
-            'RIGHT': Vector(1, 0)
-        }
+        input_map = {'UP': Vector(0, -1),
+                     'DOWN': Vector(0, 1),
+                     'LEFT': Vector(-1, 0),
+                     'RIGHT': Vector(1, 0)}
 
         if data in input_map:
             avatar.move(input_map.get(data))
@@ -281,7 +302,7 @@ class MessageHandler(object):
 
 class WorldThread(Greenlet):
 
-    TICKRATE = 10
+    TICKRATE = 1.0 / 10.0
 
     def __init__(self, map):
         super(WorldThread, self).__init__()
@@ -293,6 +314,8 @@ class WorldThread(Greenlet):
         self.avatars = AvatarCollection()
         self.channels = ChannelCollection()
         self.message_handler = MessageHandler(self)
+
+        self.objects = set()
 
     def enqueue(self, avatar, msg):
         self.input.put((avatar, msg))
@@ -310,8 +333,7 @@ class WorldThread(Greenlet):
 
         self.avatars.tick(delta)
 
-        dirty_avatars = self.avatars.dirty()
-        for avatar in dirty_avatars:
+        for avatar in self.avatars.dirty():
             self.channels.broadcast_update(avatar)
 
         self.avatars.clean()
@@ -319,21 +341,34 @@ class WorldThread(Greenlet):
     def _run(self):
         self.running = True
 
+        next_tick = time.time()
+
+        next_fps = time.time()
+        last_fps = time.time()
+        fps_filter = 1.0
+        fps = 0.0
+
         while self.running:
-            last = time.time()
-
-            # FIXME track delta
-
-            self.tick(0)
-            self.ticks += 1
-
             now = time.time()
-            delta = now - last
-            sleepy_time = max((1.0 / self.TICKRATE) - delta, 0)
 
-            #log.debug('tick took %s, sleeping for %s', delta, sleepy_time)
+            if now >= next_tick:
+                self.tick(self.TICKRATE)
+                self.ticks += 1
+                next_tick += self.TICKRATE
 
-            gevent.sleep(sleepy_time)
+                if now >= next_fps:
+                    frame_fps = 100.0 / (now - last_fps)
+                    fps += ((frame_fps - fps) / fps_filter)
+                    #log.debug('ticks per second: %.02f', fps)
+                    last_fps = now
+                    next_fps += 10
+
+            else:
+                sleep_time = next_tick - now
+
+                if sleep_time > 0:
+                    #log.debug('sleeping for %.02f', sleep_time)
+                    gevent.sleep(sleep_time)
 
     def spawn(self, cls=None, args=None, kwargs=None):
         cls = cls or Avatar
@@ -342,6 +377,7 @@ class WorldThread(Greenlet):
 
         avatar = cls(*args, **kwargs)
         self.avatars.add(avatar)
+        self.objects.add(avatar)
         self.enqueue(avatar, message('spawn'))
         return avatar
 
@@ -354,7 +390,14 @@ class WorldThread(Greenlet):
     def kill(self, avatar):
         self.channels.remove(avatar)
         self.avatars.remove(avatar)
+        self.objects.remove(avatar)
         self.enqueue(avatar, message('die'))
+
+    # FIXME - line of sight
+    def inspect(self, location, radius):
+        in_range = lambda i: i.position.distance(location) < radius
+        return [i for i in self.objects if in_range(i)]
+
 
 # FIXME limit map chunk by vision
 class Avatar(object):
@@ -405,20 +448,25 @@ class Avatar(object):
             self.mark_dirty()
 
 
-class NPCAvatar(Avatar):
+class NPC(Avatar):
     pass
 
 
-class Wanderer(NPCAvatar):
+class Wanderer(NPC):
     def __init__(self, range):
         super(Wanderer, self).__init__()
         self.range = range
-
+        self.rest = 0
+        
     def tick(self, delta):
-        if not self.waypoint:
+
+        if not self.waypoint and self.rest <= 0:
             tmp = Vector(random.randint(-self.range, self.range),
                          random.randint(-self.range, self.range))
             self.waypoint = self.position + tmp
+            self.rest = random.randint(3, 10)
+        elif self.rest > 0:
+            self.rest -= delta
 
         super(Wanderer, self).tick(delta)
 
@@ -439,6 +487,9 @@ def endpoint(request):
 
     while channel.is_running:
         msg = channel.receive()
+        if not msg:
+            break
+
         World.enqueue(avatar, msg)
 
     channel.wait()
@@ -447,8 +498,6 @@ def endpoint(request):
     World.kill(avatar)
 
     log.debug('killed avatar %s', avatar.uid)
-
-    return ''
 
 
 @view_config(route_name='root', renderer='/base.mako')
@@ -468,6 +517,10 @@ def server_factory(global_conf, host, port):
 
 
 def main(global_config, **settings):
+
+    signal.signal(signal.SIGUSR2,
+                  lambda sig, frame: code.interact(local=globals()))
+
     config = Configurator(settings=settings)
     config.add_static_view('static', 'chattr:static')
 
